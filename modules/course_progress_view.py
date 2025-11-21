@@ -343,7 +343,7 @@ def show_board():
                 st.caption("※ この予約には、表示可能なピザ商品がありません。")
                 continue
 
-            # ===== 各商品の行（ピザ対象かつ未配膳のものだけ） =====
+            # ===== 各商品の行（未配膳のものだけ） =====
             total_items = len(items_for_res)
 
             for row_idx, p in enumerate(items_for_res):
@@ -355,14 +355,29 @@ def show_board():
                 time_str = sched_time.strftime('%H:%M')
 
                 is_cooked = p.get("is_cooked", False)
-                is_served = p.get("is_served", False)
+                is_served = p.get("is_served", False)  # ここは全部 False のはずだが念のため
 
                 # メイン枠なら、予約ごとのメイン料理名で上書き
                 display_name = item["item_name"]
                 if item["item_name"] == "メイン":
-                    main_choice = resv.get("main_choice")
-                    if main_choice:
-                        display_name = main_choice
+                    detail = p.get("main_detail")
+                    qty = p.get("quantity", 1)
+
+                    # ★ ピザ以外のメインは表示しない
+                    if detail and ("ピザ" not in detail):
+                        continue  # ← 表示せず次のループへ
+
+                    if detail:
+                        display_name = f"{detail}：{qty}"
+                    else:
+                        # フォールバック（旧 main_choice）
+                        main_choice = resv.get("main_choice")
+                        if main_choice:
+                            # 旧 main_choice 中に "ピザ" が含まれていなければスキップ
+                            if "ピザ" not in main_choice:
+                                continue
+                            display_name = main_choice
+
 
                 # 商品見出し：時間(赤)＋商品名
                 st.markdown(
@@ -407,6 +422,7 @@ def show_board():
                         "<hr style='margin:8px 0; border:none; border-top:1px solid #333333;'/>",
                         unsafe_allow_html=True
                     )
+
 
 
 # ===== 調理済み・配膳済み一覧 =====
@@ -557,9 +573,15 @@ def show_cooked_list():
                 # メイン枠なら、予約ごとのメイン料理名で上書き
                 display_name = item["item_name"]
                 if item["item_name"] == "メイン":
-                    main_choice = resv.get("main_choice")
-                    if main_choice:
-                        display_name = main_choice
+                    detail = p.get("main_detail")
+                    qty = p.get("quantity", 1)
+                    if detail:
+                        display_name = f"{detail}：{qty}"
+                    else:
+                        main_choice = resv.get("main_choice")
+                        if main_choice:
+                            display_name = main_choice
+
 
                 st.markdown(
                     f"""
@@ -729,9 +751,15 @@ def show_served_list():
                 # メイン枠なら、予約ごとのメイン料理名で上書き
                 display_name = item["item_name"]
                 if item["item_name"] == "メイン":
-                    main_choice = resv.get("main_choice")
-                    if main_choice:
-                        display_name = main_choice
+                    detail = p.get("main_detail")
+                    qty = p.get("quantity", 1)
+                    if detail:
+                        display_name = f"{detail}：{qty}"
+                    else:
+                        main_choice = resv.get("main_choice")
+                        if main_choice:
+                            display_name = main_choice
+
 
                 st.markdown(
                     f"""
