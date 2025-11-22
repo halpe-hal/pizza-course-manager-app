@@ -5,6 +5,7 @@ from datetime import datetime, date, time, timedelta
 from collections import Counter
 from .supabase_client import supabase
 from typing import Optional
+from .time_utils import get_today_jst
 
 # テーブル番号の選択肢
 TABLE_OPTIONS = [
@@ -160,7 +161,16 @@ def is_slot_conflicted(reserved_at: datetime, table_no: str, exclude_reservation
 
 
 
-def create_reservation_and_progress(course_id, reserved_at, guest_name, guest_count, table_no, note, main_choice=None,):
+def create_reservation_and_progress(
+    course_id,
+    reserved_at,
+    guest_name,
+    guest_count,
+    table_no,
+    note,
+    main_choice=None,
+    main_detail_counts=None,  # ★ 追加: {"パスタ": 1, "ピザ": 1} みたいな dict
+):
     # 1. 同じ時間・同じテーブルに予約がないか確認
     if is_slot_conflicted(reserved_at, table_no):
         return False, "この時間帯は同じテーブルに別の予約が入っているため、登録できません。"
@@ -174,7 +184,7 @@ def create_reservation_and_progress(course_id, reserved_at, guest_name, guest_co
         "table_no": table_no,               # 必須（プルダウン）
         "status": "reserved",
         "note": note or None,
-        "main_choice": main_choice, 
+        "main_choice": main_choice,
     }
     try:
         res = supabase.table("course_reservations").insert(reservation_data).execute()
@@ -193,15 +203,35 @@ def create_reservation_and_progress(course_id, reserved_at, guest_name, guest_co
     progress_rows = []
     for item in items:
         scheduled_time = reserved_at + timedelta(minutes=int(item["offset_minutes"]))
-        progress_rows.append(
-            {
-                "reservation_id": reservation_id,
-                "course_item_id": item["id"],
-                "scheduled_time": scheduled_time.isoformat(),
-                "is_cooked": False,
-                "is_served": False,
-            }
-        )
+
+        if item["item_name"] == "メイン" and main_detail_counts:
+            # ★ メインは種類ごとに別レコードで作成
+            for name, cnt in main_detail_counts.items():
+                if cnt <= 0:
+                    continue
+                progress_rows.append(
+                    {
+                        "reservation_id": reservation_id,
+                        "course_item_id": item["id"],
+                        "scheduled_time": scheduled_time.isoformat(),
+                        "is_cooked": False,
+                        "is_served": False,
+                        "main_detail": name,       # パスタ / ピザ
+                        "quantity": int(cnt),      # 皿数
+                    }
+                )
+        else:
+            # メイン以外は従来どおり 1レコード
+            progress_rows.append(
+                {
+                    "reservation_id": reservation_id,
+                    "course_item_id": item["id"],
+                    "scheduled_time": scheduled_time.isoformat(),
+                    "is_cooked": False,
+                    "is_served": False,
+                    "quantity": 1,              # 新カラム（デフォルト1）
+                }
+            )
 
     try:
         supabase.table("course_progress").insert(progress_rows).execute()
@@ -209,6 +239,7 @@ def create_reservation_and_progress(course_id, reserved_at, guest_name, guest_co
         return False, f"予約は登録しましたが、進行テーブルの作成に失敗しました: {e}"
 
     return True, "予約とコース進行を登録しました。"
+
 
 
 def fetch_reservations_for_date(target_date: date):
@@ -237,10 +268,20 @@ def fetch_reservations_for_date(target_date: date):
 
 
 
-def update_reservation_basic(reservation_id: str, guest_name: str, guest_count: int, table_no: str, status: str, note: str, reserved_at: datetime, main_choice: Optional[str]):
+def update_reservation_basic(
+    reservation_id: str,
+    guest_name: str,
+    guest_count: int,
+    table_no: str,
+    status: str,
+    note: str,
+    reserved_at: datetime,
+    main_choice: Optional[str],
+):
     """
     予約の基本情報を更新（コースと日時は今回は編集対象外）。
     同じ時間×テーブルの重複チェックも行う。
+    メイン人数が変更された場合は、メインの商品進行も作り直す。
     """
     # 同じ時間・テーブルの重複チェック（自分自身は除外）
     if is_slot_conflicted(reserved_at, table_no, exclude_reservation_id=reservation_id):
@@ -252,14 +293,75 @@ def update_reservation_basic(reservation_id: str, guest_name: str, guest_count: 
         "table_no": table_no,
         "status": status,
         "note": note or None,
-        "main_choice": main_choice, 
+        "main_choice": main_choice,
     }
 
     try:
         supabase.table("course_reservations").update(update_data).eq("id", reservation_id).execute()
-        return True, "予約情報を更新しました。"
     except Exception as e:
         return False, f"予約情報の更新に失敗しました: {e}"
+
+    # ★ メインの内訳を course_progress にも反映
+    try:
+        # この予約の course_id を取得
+        res = (
+            supabase.table("course_reservations")
+            .select("course_id")
+            .eq("id", reservation_id)
+            .single()
+            .execute()
+        )
+        course_id = res.data["course_id"]
+
+        if course_has_main_item(course_id):
+            # メイン用の course_item 一覧
+            res_items = (
+                supabase.table("course_items")
+                .select("id, offset_minutes, item_name")
+                .eq("course_id", course_id)
+                .eq("item_name", "メイン")
+                .execute()
+            )
+            main_items = res_items.data or []
+            main_item_ids = [i["id"] for i in main_items]
+
+            if main_item_ids:
+                # 既存のメイン progress を削除
+                supabase.table("course_progress").delete() \
+                    .eq("reservation_id", reservation_id) \
+                    .in_("course_item_id", main_item_ids) \
+                    .execute()
+
+                # main_choice から人数 dict を再生成
+                counts = parse_main_choice_to_counts(main_choice) if main_choice else {}
+
+                if counts:
+                    progress_rows = []
+                    for item in main_items:
+                        scheduled_time = reserved_at + timedelta(minutes=int(item["offset_minutes"]))
+                        for name, cnt in counts.items():
+                            if cnt <= 0:
+                                continue
+                            progress_rows.append(
+                                {
+                                    "reservation_id": reservation_id,
+                                    "course_item_id": item["id"],
+                                    "scheduled_time": scheduled_time.isoformat(),
+                                    "is_cooked": False,
+                                    "is_served": False,
+                                    "main_detail": name,
+                                    "quantity": int(cnt),
+                                }
+                            )
+                    if progress_rows:
+                        supabase.table("course_progress").insert(progress_rows).execute()
+
+    except Exception as e:
+        # 予約自体は更新できているので、ここは警告に留める
+        st.warning(f"メイン料理の進行データ更新に失敗しました: {e}")
+
+    return True, "予約情報を更新しました。"
+
 
 
 def delete_reservation(reservation_id: str):
@@ -279,28 +381,47 @@ def delete_reservation(reservation_id: str):
 def show():
     st.subheader("コース予約登録")
 
+    # 前回成功時のメッセージを表示（1回だけ）
+    success_msg = st.session_state.pop("reservation_success_message", None)
+    if success_msg:
+        st.success(success_msg)
+
     courses = fetch_courses()
     if not courses:
         st.warning("有効なコースがまだ登録されていません。先に『コースマスタ管理』でコースを登録・有効化してください。")
         return
+
+    # フォームの「バージョン」：成功時だけ +1 して全ウィジェットの key を変える
+    form_version = st.session_state.get("reservation_form_version", 0)
 
     # ======================
     # 予約登録フォーム
     # ======================
     st.markdown("### 新規予約")
 
-    with st.form("reservation_form", clear_on_submit=True):
+    form_key_suffix = f"_v{form_version}"
+
+    # エラー時は入力を残したいので clear_on_submit=False
+    with st.form(f"reservation_form{form_key_suffix}", clear_on_submit=False):
         col1, col2 = st.columns(2)
 
         with col1:
-            selected_course_name = st.selectbox("コースを選択", [c["name"] for c in courses])
+            # コース選択
+            selected_course_name = st.selectbox(
+                "コースを選択",
+                [c["name"] for c in courses],
+                key=f"course_select{form_key_suffix}",
+            )
 
             # ここで course を特定
             course_for_form = next(c for c in courses if c["name"] == selected_course_name)
             selected_course_id = course_for_form["id"]
             has_main = course_has_main_item(selected_course_id)
 
-            guest_name = st.text_input("お名前（必須）", "")
+            guest_name = st.text_input(
+                "お名前（必須）",
+                key=f"guest_name_input{form_key_suffix}",
+            )
 
             guest_count = st.number_input(
                 "人数",
@@ -308,6 +429,7 @@ def show():
                 max_value=20,
                 value=2,
                 step=1,
+                key=f"guest_count_input{form_key_suffix}",
             )
 
             # テーブル番号はプルダウン（必須）
@@ -316,19 +438,30 @@ def show():
                 "テーブル番号（必須）",
                 options=table_select_options,
                 index=0,
+                key=f"table_no_input{form_key_suffix}",
             )
 
         with col2:
-            date_input_val = st.date_input("予約日", value=date.today())
+            date_input_val = st.date_input(
+                "予約日",
+                value=get_today_jst(),
+                key=f"reservation_date{form_key_suffix}",
+            )
 
-            # ---- 予約時間は固定4つ ----
-            time_str = st.selectbox("予約時間", TIME_OPTIONS)
+            time_str = st.selectbox(
+                "予約時間",
+                TIME_OPTIONS,
+                key=f"reservation_time{form_key_suffix}",
+            )
             time_input_val = datetime.strptime(time_str, "%H:%M").time()
 
-            note = st.text_area("メモ（任意）", "")
+            note = st.text_area(
+                "メモ（任意）",
+                key=f"reservation_note{form_key_suffix}",
+            )
 
         # メイン料理の人数入力
-        main_counts = {}  # { "パスタ": 1, "ピザ": 1 } みたいな dict になる想定
+        main_counts = {}
 
         if has_main:
             st.markdown("#### メイン料理の内訳")
@@ -337,26 +470,11 @@ def show():
                 main_counts[name] = st.number_input(
                     f"{name} の人数",
                     min_value=0,
-                    max_value=20,  # 上限はざっくりでOK、後で合計でチェックする
+                    max_value=20,
                     value=0,
                     step=1,
-                    key=f"main_{name}",
+                    key=f"main_{name}{form_key_suffix}",
                 )
-
-        # ここからはフォーム内だが、2つのカラムの「外側」に書く
-        # 選択されたコース名から course_id を特定
-        # course_for_form = next(c for c in courses if c["name"] == selected_course_name)
-        # selected_course_id = course_for_form["id"]
-
-        # # メイン料理プルダウン（そのコースに「メイン」アイテムがある場合のみ表示）
-        # main_choice = None
-        # if course_has_main_item(selected_course_id):
-        #     main_choice = st.selectbox(
-        #         "メイン料理",
-        #         options=MAIN_OPTIONS,
-        #         index=0,
-        #         key="reservation_main_choice",
-        #     )
 
         submitted = st.form_submit_button("予約を登録")
         if submitted:
@@ -374,10 +492,12 @@ def show():
                     guest_count_int = int(guest_count)
 
                     if total_main != guest_count_int:
-                        st.warning(f"メイン料理の人数合計（{total_main}名）が予約人数（{guest_count_int}名）と一致していません。")
+                        st.warning(
+                            f"メイン料理の人数合計（{total_main}名）が"
+                            f"予約人数（{guest_count_int}名）と一致していません。"
+                        )
                         st.stop()
 
-                    # 「パスタ：1、ピザ：2」形式の文字列を作成
                     parts = [
                         f"{name}：{cnt}"
                         for name, cnt in main_counts.items()
@@ -392,20 +512,28 @@ def show():
                     guest_count=int(guest_count),
                     table_no=table_selected,
                     note=note.strip() or None,
-                    main_choice=main_choice_str,  # ← ここがポイント
+                    main_choice=main_choice_str,              # 文字列
+                    main_detail_counts=main_counts if has_main else None,  # ★ 追加
                 )
 
+
                 if ok:
-                    st.success(msg)
+                    # ★ 成功したらバージョンを +1 → 次の描画で key が全部変わるのでフォームが初期化される
+                    st.session_state["reservation_form_version"] = form_version + 1
+                    st.session_state["reservation_success_message"] = msg
+                    st.rerun()
                 else:
+                    # 失敗時は入力を残したままエラー表示
                     st.error(msg)
+
+
 
     # ======================
     # 予約一覧（任意の日付）＋ 編集・削除
     # ======================
     st.markdown("### 予約一覧（対象日を選択）")
 
-    list_date = st.date_input("予約一覧の対象日", value=date.today(), key="list_date")
+    list_date = st.date_input("予約一覧の対象日", value=get_today_jst(), key="list_date")
     reservations = fetch_reservations_for_date(list_date)
 
     if not reservations:
