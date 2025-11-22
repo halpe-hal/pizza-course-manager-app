@@ -4,6 +4,9 @@ import streamlit as st
 from datetime import datetime, date, time, timedelta
 from collections import Counter
 from streamlit_autorefresh import st_autorefresh
+from typing import Optional
+from .time_utils import get_today_jst
+
 
 TIME_OPTIONS = ["18:00", "18:30", "20:30", "21:00"]
 from .supabase_client import supabase
@@ -24,7 +27,7 @@ def cleanup_old_data():
     今日より前の日付の予約と、それに紐づく course_progress を全削除する。
     （＝前日以前のデータは残さない運用）
     """
-    today = date.today()
+    today = get_today_jst()
     start_today = datetime.combine(today, time(0, 0, 0))
 
     try:
@@ -65,6 +68,15 @@ def parse_dt(dt_str: str):
         if len(base) > 19:
             base = base[:19]  # "YYYY-MM-DDTHH:MM:SS" まで
         return datetime.fromisoformat(base)
+    
+def to_jst(dt: Optional[datetime]):
+    """
+    UTC の datetime を JST(+9h) に変換して返す。
+    None の場合はそのまま None。
+    """
+    if dt is None:
+        return None
+    return dt + timedelta(hours=9)
 
 
 # 予約ステータスを更新（reserved / arrived など）
@@ -195,7 +207,7 @@ def show_board():
 
     col_date, col_info = st.columns([1, 1])
     with col_date:
-        target_date = st.date_input("対象日", value=date.today())
+        target_date = st.date_input("対象日", value=get_today_jst())
     with col_info:
         st.caption("※ 予約数が多い日は、画面下の横スクロールバーで左右に移動できます。")
 
@@ -445,7 +457,7 @@ def show_cooked_list():
     if st.session_state["auto_refresh_cooked"]:
         st_autorefresh(interval=5000, key="cooked_autorefresh_counter")
 
-    target_date = st.date_input("対象日（調理日）", value=date.today(), key="cooked_date")
+    target_date = st.date_input("対象日（調理日）", value=get_today_jst(), key="cooked_date")
     start_dt = datetime.combine(target_date, time(0, 0, 0))
     end_dt = datetime.combine(target_date + timedelta(days=1), time(0, 0, 0))
 
@@ -569,26 +581,24 @@ def show_cooked_list():
                     continue
 
                 cooked_at = parse_dt(p["cooked_at"])
+                cooked_at_jst = to_jst(cooked_at)
 
                 # メイン枠なら、予約ごとのメイン料理名で上書き
                 display_name = item["item_name"]
                 if item["item_name"] == "メイン":
-                    detail = p.get("main_detail")
-                    qty = p.get("quantity", 1)
-                    if detail:
-                        display_name = f"{detail}：{qty}"
-                    else:
-                        main_choice = resv.get("main_choice")
-                        if main_choice:
-                            display_name = main_choice
+                    main_choice = resv.get("main_choice")
+                    if main_choice:
+                        display_name = main_choice
 
+                # 安全のため None チェック
+                time_label = cooked_at_jst.strftime('%H:%M') if cooked_at_jst else "--:--"
 
                 st.markdown(
                     f"""
                     <div style="margin-top:4px; margin-bottom:4px;">
                         <div style="font-size:16px; font-weight:600;">
                             <span style="color:#d9534f; font-weight:700; margin-right:4px;">
-                                {cooked_at.strftime('%H:%M')}
+                                {time_label}
                             </span>
                             <span>{display_name}</span>
                         </div>
@@ -596,6 +606,7 @@ def show_cooked_list():
                     """,
                     unsafe_allow_html=True
                 )
+
 
                 # 区切り線
                 if row_idx < total_items - 1:
@@ -623,7 +634,7 @@ def show_served_list():
     if st.session_state["auto_refresh_cooked"]:
         st_autorefresh(interval=5000, key="cooked_autorefresh_counter")
 
-    target_date = st.date_input("対象日（配膳日）", value=date.today(), key="served_date")
+    target_date = st.date_input("対象日（配膳日）", value=get_today_jst(), key="served_date")
     start_dt = datetime.combine(target_date, time(0, 0, 0))
     end_dt = datetime.combine(target_date + timedelta(days=1), time(0, 0, 0))
 
@@ -747,26 +758,23 @@ def show_served_list():
                     continue
 
                 served_at = parse_dt(p["served_at"])
+                served_at_jst = to_jst(served_at)
 
                 # メイン枠なら、予約ごとのメイン料理名で上書き
                 display_name = item["item_name"]
                 if item["item_name"] == "メイン":
-                    detail = p.get("main_detail")
-                    qty = p.get("quantity", 1)
-                    if detail:
-                        display_name = f"{detail}：{qty}"
-                    else:
-                        main_choice = resv.get("main_choice")
-                        if main_choice:
-                            display_name = main_choice
+                    main_choice = resv.get("main_choice")
+                    if main_choice:
+                        display_name = main_choice
 
+                time_label = served_at_jst.strftime('%H:%M') if served_at_jst else "--:--"
 
                 st.markdown(
                     f"""
                     <div style="margin-top:4px; margin-bottom:4px;">
                         <div style="font-size:16px; font-weight:600;">
                             <span style="color:#d9534f; font-weight:700; margin-right:4px;">
-                                {served_at.strftime('%H:%M')}
+                                {time_label}
                             </span>
                             <span>{display_name}</span>
                         </div>
@@ -774,6 +782,7 @@ def show_served_list():
                     """,
                     unsafe_allow_html=True
                 )
+
 
                 # ★ここで「配膳済みを戻す」ボタン（→ 進行ボードへ戻す）
                 if st.button(
